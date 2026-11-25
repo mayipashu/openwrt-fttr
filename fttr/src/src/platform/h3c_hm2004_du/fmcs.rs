@@ -161,14 +161,21 @@ fn update_gpon_control(
     mut write: impl FnMut(u32) -> io::Result<()>,
 ) -> io::Result<u32> {
     let before = read()?;
-    let target = (before & !(GPON_TX | GPON_FEC))
-        | if tx { GPON_TX } else { 0 }
-        | if fec { GPON_FEC } else { 0 };
-    if before != target {
+    /*
+     * Owned bits only. The FMCS FPGA drives other bits of this register
+     * itself while the downstream PON engine is running, so both the
+     * "needs a write" decision and the read-back check must ignore them:
+     * a strict comparison fails at random, the caller runs fail_closed()
+     * and the optical port stays disabled until fttrd is reloaded, which
+     * on this board shows up as the line dropping mid-session.
+     */
+    let owned = GPON_TX | GPON_FEC;
+    let target = (before & !owned) | if tx { GPON_TX } else { 0 } | if fec { GPON_FEC } else { 0 };
+    if before & owned != target & owned {
         write(target)?;
     }
     let actual = read()?;
-    if actual != target {
+    if actual & owned != target & owned {
         return Err(io::Error::other(format!(
             "GPON control readback mismatch: wanted {target:#010x}, got {actual:#010x}"
         )));
