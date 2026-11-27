@@ -175,11 +175,18 @@ pub(crate) struct OpticalActor {
     pub state: OpticalState,
 }
 impl OpticalActor {
-    /// Reuse request failure policy for autonomous TX/FEC reconciliation too.
+    /// Autonomous TX/FEC reconciliation on the periodic poll.
+    ///
+    /// This deliberately does *not* run `fail_closed()`: the poll fires once a
+    /// second, so any single hiccup (a stale FPGA read-back while the PON
+    /// engine is busy, or the boot race before the BOSA/CDR path is ready)
+    /// used to disable the transmitter and park the port in
+    /// `OpticalState::Unknown`, which only a manual `fttrctl optical reload`
+    /// could clear. The error is still reported to the caller for logging, and
+    /// explicit transitions (on/off/reload/reinitialize) keep the strict
+    /// fail-closed policy.
     pub(crate) fn reconcile(&mut self, backend: &mut impl OpticalBackend) -> io::Result<()> {
-        backend
-            .reconcile_controls(self.state == OpticalState::Enabled)
-            .map_err(|error| self.fail_closed(backend, &mut None, error, false))
+        backend.reconcile_controls(self.state == OpticalState::Enabled)
     }
 
     fn fail_closed(
@@ -735,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn status_and_periodic_failures_close_tx_and_unknown_status_never_reenables() {
+    fn status_failure_closes_tx_but_a_poll_failure_keeps_the_line_up() {
         let mut backend = Backend {
             master: true,
             settings: fttr_api::OpticalSettings {
@@ -754,23 +761,48 @@ mod tests {
         let mut actor = OpticalActor {
             state: OpticalState::Enabled,
         };
+
+        // An explicit request that fails still closes the transmitter.
         let reply = actor.handle(OpticalCommand::Status, &mut backend);
         assert_eq!(reply["status"], "error");
         assert_eq!(reply["tx_enabled"], false);
         assert!(!backend.master);
-        backend.master = true;
-        actor.state = OpticalState::Enabled;
-        assert!(actor.reconcile(&mut backend).is_err());
-        assert!(!backend.master);
         assert!(actor.state == OpticalState::Unknown);
-        backend.fail = false;
-        backend.master = true;
-        let reply = actor.handle(OpticalCommand::Status, &mut backend);
-        assert_eq!(reply["status"], "error");
-        assert!(!backend.master, "unknown state requires an explicit reload");
+
+        // The periodic poll fires once a second, so its failure is reported for
+        // logging but must neither disable transmission nor park the port: that
+        // used to leave the line dark until a manual `optical reload`.
         backend.fail = true;
         backend.master = true;
+        actor.state = OpticalState::Enabled;
+        assert!(
+            actor.reconcile(&mut backend).is_err(),
+            "a persistent poll failure is still reported"
+        );
+        assert!(
+            backend.master,
+            "a poll failure must not stop downstream transmission"
+        );
+        assert!(
+            actor.state == OpticalState::Enabled,
+            "a poll failure must not park the port in Unknown"
+        );
+
+        // Recovery needs no manual reload: once the hardware answers again the
+        // very next poll succeeds and the port reports success.
+        backend.fail = false;
+        backend.master = true;
+        assert!(actor.reconcile(&mut backend).is_ok());
+        assert!(actor.state == OpticalState::Enabled);
+        let reply = actor.handle(OpticalCommand::Status, &mut backend);
+        assert_eq!(reply["status"], "success");
+        assert_eq!(reply["tx_enabled"], true);
+
+        // A transmitter that stays enabled despite a disable write is still
+        // surfaced as a failure, and saved settings survive it.
+        actor.state = OpticalState::Unknown;
         backend.ignore_disable = true;
+        backend.master = true;
         let reply = actor.handle(OpticalCommand::Status, &mut backend);
         assert_eq!(reply["tx_enabled"], true);
         assert!(reply["error"]["message"]
@@ -781,5 +813,6 @@ mod tests {
             backend.settings.enabled,
             "failures must preserve saved settings"
         );
+        assert!(actor.state == OpticalState::Unknown);
     }
 }

@@ -109,6 +109,30 @@ impl OpticalBackend for RuntimeOptics<'_> {
     }
 }
 
+/// Capped retry cadence for recovering from `OpticalState::Unknown`.
+struct RecoveryBackoff {
+    next: Instant,
+    delay: Duration,
+}
+impl Default for RecoveryBackoff {
+    fn default() -> Self {
+        Self {
+            next: Instant::now() + Duration::from_secs(2),
+            delay: Duration::from_secs(2),
+        }
+    }
+}
+impl RecoveryBackoff {
+    fn due(&mut self) -> bool {
+        if Instant::now() < self.next {
+            return false;
+        }
+        self.delay = (self.delay * 2).min(Duration::from_secs(60));
+        self.next = Instant::now() + self.delay;
+        true
+    }
+}
+
 fn setup_bridge() -> io::Result<()> {
     crate::platform::openwrt::network::setup_bridge(&super::RESOURCES, "br-lan")
 }
@@ -631,6 +655,7 @@ async fn run_async(platform: PlatformContext) {
             let mut grant_cycle = 0usize;
             let mut optics = OpticalActor { state };
             let mut mac_poll = crate::controller::pon_mac::Poll::default();
+            let mut recovery = RecoveryBackoff::default();
             let mut temperature_compensation = optical_calibration::Compensator::default();
             loop {
                 let ready = hardware_ready.load(Ordering::Acquire);
@@ -649,6 +674,29 @@ async fn run_async(platform: PlatformContext) {
                     if ready && !stopping.load(Ordering::Acquire) && mac_poll.due() {
                         if let Err(error) = optics.reconcile(&mut backend) {
                             eprintln!("[-] GPON controls: {error}");
+                        }
+                    }
+                    /*
+                     * `OpticalState::Unknown` used to be a dead end: nothing in
+                     * this loop ever retried, so one failed transition left the
+                     * line dark until somebody ran `fttrctl optical reload`.
+                     * Re-initialise autonomously with a capped backoff instead.
+                     */
+                    if ready
+                        && !stopping.load(Ordering::Acquire)
+                        && optics.state == OpticalState::Unknown
+                        && recovery.due()
+                    {
+                        eprintln!("[*] Optical state unknown; retrying initialisation");
+                        let reply = optics.handle(OpticalCommand::Reinitialize, &mut backend);
+                        match reply["status"].as_str() {
+                            Some("success") => eprintln!("[+] Optical transmission restored"),
+                            _ => {
+                                let detail = reply["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("unknown error");
+                                eprintln!("[-] Optical re-initialisation failed: {detail}");
+                            }
                         }
                     }
                     backend.mac_tx_allowed()
