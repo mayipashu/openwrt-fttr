@@ -2,18 +2,40 @@
 use std::sync::{Mutex, OnceLock};
 
 /// Shared owner-side completion policy; platform adapters retain register layout.
+/// Attempts for one autonomous reconciliation before it is reported as failed.
+const RECONCILE_ATTEMPTS: u32 = 3;
+/// Settle time between reconciliation attempts.
+const RECONCILE_SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
+
+fn verify(
+    value: crate::platform::resources::PonMacReadback,
+    desired: (bool, bool),
+) -> std::io::Result<crate::platform::resources::PonMacReadback> {
+    if value.tx_enabled != Some(desired.0) || value.fec_enabled != Some(desired.1) {
+        Err(std::io::Error::other("GPON TX/FEC readback mismatch"))
+    } else {
+        Ok(value)
+    }
+}
+
 pub(crate) fn reconcile(
     desired: (bool, bool),
-    quiesce: impl FnOnce() -> std::io::Result<()>,
-    write: impl FnOnce(bool, bool) -> std::io::Result<crate::platform::resources::PonMacReadback>,
+    mut quiesce: impl FnMut() -> std::io::Result<()>,
+    mut write: impl FnMut(bool, bool) -> std::io::Result<crate::platform::resources::PonMacReadback>,
 ) -> std::io::Result<()> {
-    let result = apply(desired, quiesce, write).and_then(|value| {
-        if value.tx_enabled != Some(desired.0) || value.fec_enabled != Some(desired.1) {
-            Err(std::io::Error::other("GPON TX/FEC readback mismatch"))
-        } else {
-            Ok(value)
-        }
-    });
+    /*
+     * This runs once a second from the PLOAM owner, so a single stale read-back
+     * must not be treated as a hardware fault. Retry the whole transaction with
+     * the owned-bit write re-asserted before reporting a failure.
+     */
+    let mut result =
+        apply(desired, &mut quiesce, &mut write).and_then(|value| verify(value, desired));
+    let mut attempt = 0;
+    while result.is_err() && attempt + 1 < RECONCILE_ATTEMPTS {
+        attempt += 1;
+        std::thread::sleep(RECONCILE_SETTLE);
+        result = apply(desired, &mut quiesce, &mut write).and_then(|value| verify(value, desired));
+    }
     let error = result.as_ref().err().map(ToString::to_string);
     record(result);
     error.map_or(Ok(()), |error| Err(std::io::Error::other(error)))
@@ -45,8 +67,8 @@ impl Poll {
 
 pub(crate) fn apply<T>(
     desired: (bool, bool),
-    quiesce: impl FnOnce() -> std::io::Result<()>,
-    write: impl FnOnce(bool, bool) -> std::io::Result<T>,
+    mut quiesce: impl FnMut() -> std::io::Result<()>,
+    mut write: impl FnMut(bool, bool) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     let cleanup = if !desired.0 { quiesce() } else { Ok(()) };
     // Failure to drain workers must not prevent disabling transmission.
@@ -79,15 +101,38 @@ pub(crate) fn record(result: std::io::Result<crate::platform::resources::PonMacR
         Ok(value) => (Some(value), None),
         Err(error) => (None, Some(error.to_string())),
     };
-    let allowed = readback
-        .as_ref()
-        .is_some_and(|value| value.tx_enabled == Some(true));
-    *cache().lock().unwrap() = Some(fttr_api::PonMacStatus {
+    /*
+     * A failed sample is not evidence that transmission stopped: the FPGA can
+     * miss a single SPI transaction while the downstream PON engine is busy.
+     * Fall back to the last good readback so `mac_tx_allowed()` survives a
+     * transient hiccup instead of stalling the PLOAM engine, which would drop
+     * every downstream ONU until fttrd is reloaded.
+     */
+    let mut cached = cache().lock().unwrap();
+    let previous = cached.take();
+    let (register, tx_enabled, fec_enabled, allowed) = match readback.as_ref() {
+        Some(value) => (
+            value.raw,
+            value.tx_enabled,
+            value.fec_enabled,
+            value.tx_enabled == Some(true),
+        ),
+        None => match previous.as_ref() {
+            Some(previous) => (
+                previous.register,
+                previous.tx_enabled,
+                previous.fec_enabled,
+                previous.tx_enabled == Some(true),
+            ),
+            None => (None, None, None, false),
+        },
+    };
+    *cached = Some(fttr_api::PonMacStatus {
         desired_tx_enabled: desired.0,
         desired_fec_enabled: desired.1,
-        register: readback.as_ref().and_then(|value| value.raw),
-        tx_enabled: readback.as_ref().and_then(|value| value.tx_enabled),
-        fec_enabled: readback.as_ref().and_then(|value| value.fec_enabled),
+        register,
+        tx_enabled,
+        fec_enabled,
         error,
     });
     allowed

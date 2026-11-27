@@ -138,6 +138,10 @@ fn write_fpga_reg_unlocked(addr: u32, val: u32) -> io::Result<()> {
 pub const FPGA_GPON_CONTROL: u32 = 0x01000004;
 const GPON_TX: u32 = 0x02;
 const GPON_FEC: u32 = 0x08;
+/// Read-back attempts before a GPON control write is declared failed.
+const GPON_CONTROL_READBACK_ATTEMPTS: u32 = 5;
+/// Settle time between a re-assert and the next read-back.
+const GPON_CONTROL_READBACK_SETTLE: Duration = Duration::from_millis(2);
 static GPON_CONTROL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Board-specific GPON control bits. Serializes in-process RMW with raw writes.
@@ -174,7 +178,22 @@ fn update_gpon_control(
     if before & owned != target & owned {
         write(target)?;
     }
-    let actual = read()?;
+    /*
+     * The FPGA latches this byte lane on its own SPI clock, so a read issued
+     * immediately after the write can still return the previous contents -
+     * notably while the PON engine is warming up right after boot. A single
+     * stale sample used to be fatal (the caller disables the transmitter and
+     * parks the port in `OpticalState::Unknown` until a manual reload), so
+     * re-assert the owned bits and re-read a few times before giving up.
+     */
+    let mut actual = read()?;
+    let mut attempt = 0;
+    while actual & owned != target & owned && attempt + 1 < GPON_CONTROL_READBACK_ATTEMPTS {
+        attempt += 1;
+        thread::sleep(GPON_CONTROL_READBACK_SETTLE);
+        write(target)?;
+        actual = read()?;
+    }
     if actual & owned != target & owned {
         return Err(io::Error::other(format!(
             "GPON control readback mismatch: wanted {target:#010x}, got {actual:#010x}"
