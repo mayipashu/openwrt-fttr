@@ -21,7 +21,7 @@ jobs:
           path: openwrt-fttr
       - uses: actions/checkout@v4
         with:
-          repository: LazuliKao/luci-app-fttr
+          repository: mayipashu/luci-app-fttr
           ref: ${{ inputs.frontend_ref || vars.FTTR_FRONTEND_REF || 'main' }}
           path: luci-app-fttr
       - uses: dtolnay/rust-toolchain@stable
