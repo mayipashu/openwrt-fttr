@@ -1415,7 +1415,7 @@ dependencies = [
 [[package]]
 name = "rumqttd"
 version = "0.20.0"
-source = "git+https://github.com/LazuliKao/rumqtt.git?rev=e7ad1ac94b504d43ce2659eb84db559675f6d5cf#e7ad1ac94b504d43ce2659eb84db559675f6d5cf"
+source = "git+https://github.com/mayipashu/rumqtt.git?rev=e7ad1ac94b504d43ce2659eb84db559675f6d5cf#e7ad1ac94b504d43ce2659eb84db559675f6d5cf"
 dependencies = [
  "axum",
  "bytes",
